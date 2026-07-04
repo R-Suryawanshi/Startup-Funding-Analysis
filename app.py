@@ -18,11 +18,12 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import TargetEncoder
+from catboost import CatBoostRegressor, CatBoostClassifier
+import optuna
 
 # ----------------------------------------------------------------------------
 # PAGE CONFIG
@@ -208,6 +209,7 @@ div[class*="st-key-card_dash3"] { animation-delay: 0.15s; }
 div[class*="st-key-card_dash4"] { animation-delay: 0.20s; }
 div[class*="st-key-card_dash5"] { animation-delay: 0.25s; }
 div[class*="st-key-card_dash6"] { animation-delay: 0.30s; }
+div[class*="st-key-card_dash_timelapse"] { animation-delay: 0.35s; }
 @keyframes fadeUp {
     from { opacity: 0; transform: translateY(18px); }
     to { opacity: 1; transform: translateY(0); }
@@ -418,7 +420,75 @@ def load_data(path):
         col_name = f"SubV_{kw.replace(' ', '_')}"
         df[col_name] = df["SubVertical_clean"].apply(lambda s: 1 if kw in s else 0)
 
+    # ADVANCED FEATURE ENGINEERING:
+    # 1. Investor Influence score calculation (count * mean_log_funding)
+    df_temp = df.dropna(subset=["Investors", "FundingAmount"]).copy()
+    df_temp["LogFunding"] = np.log1p(df_temp["FundingAmount"])
+    inv_exploded = df_temp[["Investors", "LogFunding"]].copy()
+    inv_exploded["Investor"] = inv_exploded["Investors"].str.split(",")
+    inv_exploded = inv_exploded.explode("Investor")
+    inv_exploded["Investor"] = inv_exploded["Investor"].str.strip()
+    inv_exploded = inv_exploded[inv_exploded["Investor"] != ""]
+    
+    inv_stats = inv_exploded.groupby("Investor").agg(
+        count=("LogFunding", "count"),
+        mean_log=("LogFunding", "mean")
+    )
+    inv_stats["score"] = inv_stats["count"] * inv_stats["mean_log"]
+    investor_scores = inv_stats["score"].to_dict()
+    
+    def get_syndicate_influence(inv_str):
+        if pd.isna(inv_str):
+            return 0.0
+        parts = [p.strip() for p in str(inv_str).split(",") if p.strip()]
+        scores = [investor_scores.get(p, 0.0) for p in parts]
+        return float(np.max(scores)) if scores else 0.0
+        
+    df["investor_influence"] = df["Investors"].apply(get_syndicate_influence)
+
+    # 2. Rolling industry and city temporal trends (excluding target leaks via shift(1))
+    ind_year_funding = df.groupby(["Year", "Industry_clean"])["FundingAmount"].sum().reset_index()
+    ind_year_funding["rolling_ind_funding"] = ind_year_funding.groupby("Industry_clean")["FundingAmount"].shift(1).fillna(0)
+    df = pd.merge(df, ind_year_funding[["Year", "Industry_clean", "rolling_ind_funding"]], on=["Year", "Industry_clean"], how="left")
+    df["rolling_ind_funding"] = df["rolling_ind_funding"].fillna(0)
+    
+    city_year_funding = df.groupby(["Year", "City_clean"])["FundingAmount"].sum().reset_index()
+    city_year_funding["rolling_city_funding"] = city_year_funding.groupby("City_clean")["FundingAmount"].shift(1).fillna(0)
+    df = pd.merge(df, city_year_funding[["Year", "City_clean", "rolling_city_funding"]], on=["Year", "City_clean"], how="left")
+    df["rolling_city_funding"] = df["rolling_city_funding"].fillna(0)
+
     return df
+
+
+def add_engineered_features(df_input, df_reference):
+    df_out = df_input.copy()
+    
+    top_subset = df_reference[df_reference["HasTopInvestor"] == 1]
+    mean_top_influence = float(top_subset["investor_influence"].mean()) if not top_subset.empty else 0.0
+    
+    df_out["investor_influence"] = df_out["HasTopInvestor"].apply(
+        lambda x: mean_top_influence if x == 1 else 0.0
+    )
+    
+    ind_rolling = df_reference.groupby(["Year", "Industry_clean"])["rolling_ind_funding"].first().to_dict()
+    ind_avg = df_reference.groupby("Industry_clean")["rolling_ind_funding"].mean().to_dict()
+    
+    def get_ind_rolling(row):
+        year, ind = row["Year"], row["Industry_clean"]
+        return ind_rolling.get((year, ind), ind_avg.get(ind, 0.0))
+        
+    df_out["rolling_ind_funding"] = df_out.apply(get_ind_rolling, axis=1)
+    
+    city_rolling = df_reference.groupby(["Year", "City_clean"])["rolling_city_funding"].first().to_dict()
+    city_avg = df_reference.groupby("City_clean")["rolling_city_funding"].mean().to_dict()
+    
+    def get_city_rolling(row):
+        year, city = row["Year"], row["City_clean"]
+        return city_rolling.get((year, city), city_avg.get(city, 0.0))
+        
+    df_out["rolling_city_funding"] = df_out.apply(get_city_rolling, axis=1)
+    
+    return df_out
 
 
 # ----------------------------------------------------------------------------
@@ -431,20 +501,56 @@ def train_regression_model(df):
     reg_df = df.dropna(subset=["FundingAmount"]).copy()
     reg_df["LogFunding"] = np.log1p(reg_df["FundingAmount"])
 
-    feat_cols = ["Industry_clean", "City_clean", "InvType_clean", "Year", "Quarter", "InvestorCount", "HasTopInvestor"] + [f"SubV_{kw.replace(' ', '_')}" for kw in KEYWORDS]
+    feat_cols = ["Industry_clean", "City_clean", "InvType_clean", "Year", "Quarter", "InvestorCount", "HasTopInvestor", "investor_influence", "rolling_ind_funding", "rolling_city_funding"] + [f"SubV_{kw.replace(' ', '_')}" for kw in KEYWORDS]
     cat_cols = ["Industry_clean", "City_clean", "InvType_clean"]
 
     X = reg_df[feat_cols]
     y = reg_df["LogFunding"]
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
+    # Optuna hyperparameter optimization
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    def objective(trial):
+        params = {
+            "iterations": trial.suggest_int("iterations", 100, 300),
+            "depth": trial.suggest_int("depth", 4, 8),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-2, 10.0, log=True),
+            "random_seed": 42,
+            "verbose": 0
+        }
+        from sklearn.model_selection import KFold
+        kf = KFold(n_splits=3, shuffle=True, random_state=42)
+        scores = []
+        for train_idx, val_idx in kf.split(X_train):
+            X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+            y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+            
+            pre_fold = ColumnTransformer(
+                [("encoder", TargetEncoder(smooth="auto", random_state=42), cat_cols)], remainder="passthrough"
+            )
+            X_tr_trans = pre_fold.fit_transform(X_tr, y_tr)
+            X_val_trans = pre_fold.transform(X_val)
+            
+            model = CatBoostRegressor(**params)
+            model.fit(X_tr_trans, y_tr)
+            preds = model.predict(X_val_trans)
+            scores.append(mean_absolute_error(y_val, preds))
+        return float(np.mean(scores))
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=8)
+    best_params = study.best_params
+    best_params["random_seed"] = 42
+    best_params["verbose"] = 0
+
     pre = ColumnTransformer(
-        [("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)], remainder="passthrough"
+        [("encoder", TargetEncoder(smooth="auto", random_state=42), cat_cols)], remainder="passthrough"
     )
     pipe = Pipeline(
         [
             ("pre", pre),
-            ("model", RandomForestRegressor(n_estimators=300, max_depth=15, min_samples_split=4, min_samples_leaf=2, random_state=42, n_jobs=-1)),
+            ("model", CatBoostRegressor(**best_params)),
         ]
     )
     pipe.fit(X_train, y_train)
@@ -455,7 +561,6 @@ def train_regression_model(df):
         "mae_dollar": mean_absolute_error(np.expm1(y_test), np.expm1(pred)),
     }
 
-    # residual spread (log space) -> used to build a rough prediction interval
     resid_std = float(np.std(y_test.values - pred))
 
     return pipe, metrics, resid_std, feat_cols
@@ -463,14 +568,9 @@ def train_regression_model(df):
 
 @st.cache_resource
 def train_tier_classification_model(df):
-    """Predict the FundingTier bucket using the SAME inputs as the regression
-    model (industry, city, investment type, timing, investor count) — i.e. no
-    funding-amount feature is used, since FundingTier is derived from it.
-    Bucketing the skewed dollar target into 4 interpretable classes is a more
-    learnable problem for these features than exact-dollar regression."""
     tier_df = df.dropna(subset=["FundingAmount"]).copy()
 
-    feat_cols = ["Industry_clean", "City_clean", "InvType_clean", "Year", "Quarter", "InvestorCount", "HasTopInvestor"] + [f"SubV_{kw.replace(' ', '_')}" for kw in KEYWORDS]
+    feat_cols = ["Industry_clean", "City_clean", "InvType_clean", "Year", "Quarter", "InvestorCount", "HasTopInvestor", "investor_influence", "rolling_ind_funding", "rolling_city_funding"] + [f"SubV_{kw.replace(' ', '_')}" for kw in KEYWORDS]
     cat_cols = ["Industry_clean", "City_clean", "InvType_clean"]
 
     X = tier_df[feat_cols]
@@ -479,22 +579,55 @@ def train_tier_classification_model(df):
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
+    # Optuna hyperparameter optimization
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    def objective(trial):
+        params = {
+            "iterations": trial.suggest_int("iterations", 100, 300),
+            "depth": trial.suggest_int("depth", 4, 8),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-2, 10.0, log=True),
+            "random_seed": 42,
+            "verbose": 0,
+            "auto_class_weights": "Balanced"
+        }
+        from sklearn.model_selection import StratifiedKFold
+        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        scores = []
+        for train_idx, val_idx in skf.split(X_train, y_train):
+            X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+            y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+            
+            pre_fold = ColumnTransformer(
+                [("encoder", TargetEncoder(smooth="auto", random_state=42), cat_cols)], remainder="passthrough"
+            )
+            X_tr_trans = pre_fold.fit_transform(X_tr, y_tr)
+            X_val_trans = pre_fold.transform(X_val)
+            
+            model = CatBoostClassifier(**params)
+            model.fit(X_tr_trans, y_tr)
+            preds = model.predict(X_val_trans).flatten()
+            scores.append(f1_score(y_val, preds, average="macro"))
+        return float(np.mean(scores))
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=8)
+    best_params = study.best_params
+    best_params["random_seed"] = 42
+    best_params["verbose"] = 0
+    best_params["auto_class_weights"] = "Balanced"
+
     pre = ColumnTransformer(
-        [("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)], remainder="passthrough"
+        [("encoder", TargetEncoder(smooth="auto", random_state=42), cat_cols)], remainder="passthrough"
     )
     pipe = Pipeline(
         [
             ("pre", pre),
-            (
-                "model",
-                RandomForestClassifier(
-                    n_estimators=300, max_depth=15, min_samples_split=4, min_samples_leaf=2, random_state=42, n_jobs=-1, class_weight="balanced"
-                ),
-            ),
+            ("model", CatBoostClassifier(**best_params)),
         ]
     )
     pipe.fit(X_train, y_train)
-    pred = pipe.predict(X_test)
+    pred = pipe.predict(X_test).flatten()
 
     metrics = {
         "accuracy": accuracy_score(y_test, pred),
@@ -514,7 +647,7 @@ def train_classification_model(df):
     keep_classes = vc[vc >= 15].index
     clf_df = clf_df[clf_df["InvType_clean"].isin(keep_classes)]
 
-    feat_cols = ["Industry_clean", "City_clean", "Year", "Quarter", "LogFunding", "InvestorCount", "HasTopInvestor"] + [f"SubV_{kw.replace(' ', '_')}" for kw in KEYWORDS]
+    feat_cols = ["Industry_clean", "City_clean", "Year", "Quarter", "LogFunding", "InvestorCount", "HasTopInvestor", "investor_influence", "rolling_ind_funding", "rolling_city_funding"] + [f"SubV_{kw.replace(' ', '_')}" for kw in KEYWORDS]
     cat_cols = ["Industry_clean", "City_clean"]
 
     X = clf_df[feat_cols]
@@ -523,22 +656,55 @@ def train_classification_model(df):
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
+    # Optuna hyperparameter optimization
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    def objective(trial):
+        params = {
+            "iterations": trial.suggest_int("iterations", 100, 300),
+            "depth": trial.suggest_int("depth", 4, 8),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-2, 10.0, log=True),
+            "random_seed": 42,
+            "verbose": 0,
+            "auto_class_weights": "Balanced"
+        }
+        from sklearn.model_selection import StratifiedKFold
+        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        scores = []
+        for train_idx, val_idx in skf.split(X_train, y_train):
+            X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+            y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+            
+            pre_fold = ColumnTransformer(
+                [("encoder", TargetEncoder(smooth="auto", random_state=42), cat_cols)], remainder="passthrough"
+            )
+            X_tr_trans = pre_fold.fit_transform(X_tr, y_tr)
+            X_val_trans = pre_fold.transform(X_val)
+            
+            model = CatBoostClassifier(**params)
+            model.fit(X_tr_trans, y_tr)
+            preds = model.predict(X_val_trans).flatten()
+            scores.append(f1_score(y_val, preds, average="macro"))
+        return float(np.mean(scores))
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=8)
+    best_params = study.best_params
+    best_params["random_seed"] = 42
+    best_params["verbose"] = 0
+    best_params["auto_class_weights"] = "Balanced"
+
     pre = ColumnTransformer(
-        [("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)], remainder="passthrough"
+        [("encoder", TargetEncoder(smooth="auto", random_state=42), cat_cols)], remainder="passthrough"
     )
     pipe = Pipeline(
         [
             ("pre", pre),
-            (
-                "model",
-                RandomForestClassifier(
-                    n_estimators=300, max_depth=15, min_samples_split=4, min_samples_leaf=2, random_state=42, n_jobs=-1, class_weight="balanced"
-                ),
-            ),
+            ("model", CatBoostClassifier(**best_params)),
         ]
     )
     pipe.fit(X_train, y_train)
-    pred = pipe.predict(X_test)
+    pred = pipe.predict(X_test).flatten()
 
     metrics = {
         "accuracy": accuracy_score(y_test, pred),
@@ -558,6 +724,390 @@ def get_feature_importance(pipe, top_n=12):
         "remainder__", "", regex=False
     )
     return fi.sort_values("importance", ascending=False).head(top_n)
+
+
+def explain_rf_prediction(pipe, x_df, is_regression=True, class_index=None):
+    pre = pipe.named_steps["pre"]
+    model = pipe.named_steps["model"]
+    
+    if hasattr(pre, "feature_names_in_"):
+        x_df = x_df[pre.feature_names_in_]
+        
+    x_trans = pre.transform(x_df)
+    if hasattr(x_trans, "toarray"):
+        x_trans = x_trans.toarray()
+        
+    feature_names = pre.get_feature_names_out()
+    
+    from catboost import Pool
+    pool = Pool(x_trans)
+    shap_vals = model.get_feature_importance(pool, type="ShapValues")
+    
+    if len(shap_vals.shape) == 3:  # Multiclass
+        shap_single = shap_vals[0, class_index or 0]
+    else:
+        shap_single = shap_vals[0]
+        
+    contributions = shap_single[:-1]
+    bias = shap_single[-1]
+    
+    mapped_contribs = {}
+    for feat_name, contrib in zip(feature_names, contributions):
+        category = "Other"
+        if "Industry_clean" in feat_name:
+            category = "Industry"
+        elif "City_clean" in feat_name:
+            category = "City"
+        elif "InvType_clean" in feat_name:
+            category = "Investment Type"
+        elif "SubV_" in feat_name:
+            category = "Sub-Vertical Domain"
+        elif "Year" in feat_name:
+            category = "Year"
+        elif "Quarter" in feat_name:
+            category = "Quarter"
+        elif "InvestorCount" in feat_name:
+            category = "Investor Count"
+        elif "HasTopInvestor" in feat_name:
+            category = "Includes Top Investor"
+        elif "LogFunding" in feat_name:
+            category = "Funding Amount"
+        elif "investor_influence" in feat_name:
+            category = "Investor Influence"
+        elif "rolling_ind" in feat_name:
+            category = "Industry Trends"
+        elif "rolling_city" in feat_name:
+            category = "City Trends"
+            
+        mapped_contribs[category] = mapped_contribs.get(category, 0.0) + contrib
+        
+    return bias, mapped_contribs
+
+
+def make_waterfall_chart(bias, mapped_contribs, final_pred, title, is_regression=True):
+    # Sort contributions by absolute value
+    sorted_items = sorted(mapped_contribs.items(), key=lambda x: abs(x[1]), reverse=True)
+    
+    if is_regression:
+        x_names = ["Base Value (Average)"]
+        y_vals = []
+        measures = ["relative"]
+        
+        current_log_val = bias
+        current_dollar_val = np.expm1(current_log_val)
+        y_vals.append(current_dollar_val)
+        
+        for name, contrib_log in sorted_items:
+            next_log_val = current_log_val + contrib_log
+            next_dollar_val = np.expm1(next_log_val)
+            dollar_diff = next_dollar_val - current_dollar_val
+            
+            x_names.append(name)
+            y_vals.append(dollar_diff)
+            measures.append("relative")
+            
+            current_log_val = next_log_val
+            current_dollar_val = next_dollar_val
+            
+        x_names.append("Predicted Funding")
+        y_vals.append(np.expm1(final_pred))
+        measures.append("total")
+        
+        text_vals = []
+        for v, m in zip(y_vals, measures):
+            if m == "total":
+                text_vals.append(f"${v:,.0f}")
+            else:
+                sign = "+" if v >= 0 else "-"
+                text_vals.append(f"{sign}${abs(v):,.0f}")
+    else:
+        # Show probability changes in %
+        x_names = ["Base Probability"]
+        y_vals = [bias * 100]
+        measures = ["relative"]
+        
+        for name, contrib in sorted_items:
+            x_names.append(name)
+            y_vals.append(contrib * 100)
+            measures.append("relative")
+            
+        x_names.append("Predicted Probability")
+        y_vals.append(final_pred * 100)
+        measures.append("total")
+        
+        text_vals = []
+        for v, m in zip(y_vals, measures):
+            if m == "total":
+                text_vals.append(f"{v:.1f}%")
+            else:
+                sign = "+" if v >= 0 else "-"
+                text_vals.append(f"{sign}{abs(v):.1f}%")
+                
+    fig = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=measures,
+        x=x_names,
+        textposition="outside",
+        text=text_vals,
+        y=y_vals,
+        connector={"line": {"color": "rgba(255, 255, 255, 0.25)"}},
+        increasing={"marker": {"color": "#16C79A"}},
+        decreasing={"marker": {"color": "#FF6B6B"}},
+        totals={"marker": {"color": "#5B6EF5"}}
+    ))
+    
+    fig = style_fig(fig)
+    fig.update_layout(
+        title=title,
+        waterfallgap=0.3,
+        showlegend=False,
+    )
+    return fig
+
+
+def match_investors(df, industry, city, tier, domain_selected):
+    # Filter undisclosed investors
+    undisclosed = {"undisclosed investors", "undisclosed investor", "undisclosed", "unknown", "", "others", "nan"}
+    
+    # We will compute metrics for all VCs
+    vc_stats = {}
+    
+    # Keywords check
+    kw_col = None
+    if domain_selected != "None":
+        kw_col = f"SubV_{domain_selected.lower().replace(' ', '_')}"
+        
+    for _, row in df.iterrows():
+        inv_str = str(row["Investors"])
+        if not inv_str or inv_str.lower() in undisclosed:
+            continue
+        
+        # Split by comma
+        invs = [i.strip() for i in inv_str.split(",") if i.strip()]
+        for inv in invs:
+            if inv.lower() in undisclosed:
+                continue
+                
+            if inv not in vc_stats:
+                vc_stats[inv] = {
+                    "total_deals": 0,
+                    "industry_deals": 0,
+                    "city_deals": 0,
+                    "tier_deals": 0,
+                    "subv_deals": 0,
+                    "portfolios": []  # list of (startup, amount)
+                }
+                
+            stats = vc_stats[inv]
+            stats["total_deals"] += 1
+            
+            if row["Industry_clean"] == industry:
+                stats["industry_deals"] += 1
+            if row["City_clean"] == city:
+                stats["city_deals"] += 1
+            if row["FundingTier"] == tier:
+                stats["tier_deals"] += 1
+                
+            if kw_col and row.get(kw_col) == 1:
+                stats["subv_deals"] += 1
+                
+            amount = row["FundingAmount"] if pd.notna(row["FundingAmount"]) else 0.0
+            stats["portfolios"].append((row["StartupName"], amount))
+            
+    # Calculate scores
+    results = []
+    for inv, stats in vc_stats.items():
+        ind_score = (min(5, stats["industry_deals"]) / 5.0) * 40.0
+        city_score = (min(3, stats["city_deals"]) / 3.0) * 30.0
+        tier_score = (min(3, stats["tier_deals"]) / 3.0) * 30.0
+        
+        subv_bonus = 0.0
+        if kw_col:
+            subv_bonus = (min(2, stats["subv_deals"]) / 2.0) * 10.0
+            
+        score = min(100.0, ind_score + city_score + tier_score + subv_bonus)
+        
+        if score < 10.0:  # skip very low matches
+            continue
+            
+        # Get top 3 portfolios by funding amount, unique startup names
+        port_dict = {}
+        for startup, amt in stats["portfolios"]:
+            port_dict[startup] = max(port_dict.get(startup, 0.0), amt)
+        sorted_ports = sorted(port_dict.items(), key=lambda x: x[1], reverse=True)
+        top_ports = [x[0] for x in sorted_ports[:3]]
+        
+        results.append({
+            "Investor": inv,
+            "Match Score (%)": round(score, 1),
+            "Total Deals": stats["total_deals"],
+            "Industry Deals": stats["industry_deals"],
+            "City Deals": stats["city_deals"],
+            "Stage/Tier Deals": stats["tier_deals"],
+            "Key Portfolios": ", ".join(top_ports) if top_ports else "Unknown"
+        })
+        
+    res_df = pd.DataFrame(results)
+    if len(res_df) == 0:
+        return pd.DataFrame(columns=["Investor", "Match Score (%)", "Total Deals", "Industry Deals", "City Deals", "Stage/Tier Deals", "Key Portfolios"])
+        
+    return res_df.sort_values(by="Match Score (%)", ascending=False).head(10)
+
+
+def get_animated_industry_df(fdf):
+    top_ind = fdf.groupby("Industry_clean")["FundingAmount"].sum().nlargest(10).index.tolist()
+    if "Other" in top_ind:
+        top_ind.remove("Other")
+    if "Unknown" in top_ind:
+        top_ind.remove("Unknown")
+        
+    years = sorted(fdf["Year"].unique())
+    if not years or not top_ind:
+        return pd.DataFrame(columns=["Year", "Industry_clean", "FundingAmount"]), []
+        
+    import itertools
+    combinations = list(itertools.product(years, top_ind))
+    base_df = pd.DataFrame(combinations, columns=["Year", "Industry_clean"])
+    
+    agg = fdf.groupby(["Year", "Industry_clean"])["FundingAmount"].sum().reset_index()
+    merged = pd.merge(base_df, agg, on=["Year", "Industry_clean"], how="left").fillna(0)
+    
+    return merged, top_ind
+
+
+def render_3d_highcharts(chart_type, df, title, x_col, y_col, height=340, label_suffix="", x_prefix=""):
+    data_list = []
+    if chart_type == "pie":
+        for _, r in df.iterrows():
+            data_list.append([str(r[x_col]), float(r[y_col])])
+        data_json = str(data_list)
+        
+        series_config = f"""
+        series: [{{
+            type: 'pie',
+            name: '{y_col}',
+            data: {data_json}
+        }}]
+        """
+        chart_options = """
+        options3d: {
+            enabled: true,
+            alpha: 45,
+            beta: 0
+        }
+        """
+        plot_options = """
+        plotOptions: {
+            pie: {
+                allowPointSelect: true,
+                cursor: 'pointer',
+                depth: 35,
+                dataLabels: {
+                    enabled: true,
+                    format: '<b>{{point.name}}</b>: {{point.percentage:.1f}}%',
+                    style: {
+                        color: '#1B1F3B',
+                        textOutline: 'none',
+                        fontSize: '11px'
+                    }
+                }
+            }
+        }
+        """
+    else:  # column (3D vertical columns)
+        raw_cats = list(df[x_col])
+        if x_prefix:
+            categories = [f"{x_prefix}{int(float(c))}" for c in raw_cats]
+        else:
+            categories = [str(c) for c in raw_cats]
+            
+        values = list(df[y_col].astype(float))
+        
+        series_config = f"""
+        xAxis: {{
+            categories: {str(categories)},
+            labels: {{
+                style: {{ color: '#1B1F3B', fontWeight: 'bold' }}
+            }}
+        }},
+        yAxis: {{
+            title: {{ text: '' }},
+            labels: {{
+                style: {{ color: '#1B1F3B' }}
+            }}
+        }},
+        series: [{{
+            name: '{y_col}',
+            data: {str(values)},
+            color: '#5B6EF5'
+        }}]
+        """
+        chart_options = """
+        options3d: {
+            enabled: true,
+            alpha: 15,
+            beta: 15,
+            depth: 50,
+            viewDistance: 25
+        }
+        """
+        plot_options = """
+        plotOptions: {
+            column: {
+                depth: 25,
+                colorByPoint: true
+            }
+        }
+        """
+        
+    colors_json = str(["#5B6EF5", "#16C79A", "#F2B705", "#FF6B6B", "#8B5CF6", "#22D3EE", "#F97316", "#10B981"])
+    
+    html = f"""
+    <html>
+    <head>
+    <style>
+        html, body {{ margin:0; padding:0; background:transparent; font-family: 'Inter', sans-serif; }}
+        #container {{ width: 100%; height: {height}px; }}
+    </style>
+    <script src="https://code.highcharts.com/highcharts.js"></script>
+    <script src="https://code.highcharts.com/highcharts-3d.js"></script>
+    </head>
+    <body>
+        <div id="container"></div>
+        <script>
+        Highcharts.chart('container', {{
+            colors: {colors_json},
+            chart: {{
+                type: '{chart_type}',
+                backgroundColor: 'transparent',
+                {chart_options}
+            }},
+            title: {{
+                text: '{title}',
+                style: {{
+                    color: '#1B1F3B',
+                    fontFamily: 'Space Grotesk, sans-serif',
+                    fontSize: '15px',
+                    fontWeight: 'bold'
+                }}
+            }},
+            credits: {{ enabled: false }},
+            legend: {{ enabled: false }},
+            tooltip: {{
+                pointFormat: '<b>{{point.y:,.0f}}{label_suffix}</b>'
+            }},
+            {plot_options},
+            {series_config}
+        }});
+        </script>
+    </body>
+    </html>
+    """
+    return html
+
+
+
+
 
 
 # ----------------------------------------------------------------------------
@@ -744,6 +1294,7 @@ page = st.sidebar.radio(
         "💰 Predict Funding Amount",
         "🎯 Predict Funding Tier",
         "🏷️ Predict Investment Type",
+        "🤝 Investor Matchmaker & Simulator",
         "📈 Model Performance",
     ],
     label_visibility="collapsed",
@@ -752,6 +1303,7 @@ page = st.sidebar.radio(
 # Set defaults to avoid NameError if filters aren't rendered
 year_range = (int(df["Year"].min()), int(df["Year"].max()))
 inv_type_filter = sorted(df["InvType_clean"].unique())
+view_3d = False
 
 # Show dashboard filters ONLY when Dashboard is active
 if page == "📊 Dashboard":
@@ -770,6 +1322,9 @@ if page == "📊 Dashboard":
         default=inv_type_filter,
         key="dash_inv_multiselect"
     )
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🌐 Visual Projection")
+    view_3d = st.sidebar.toggle("Enable 3D Chart Mode", value=False, key="toggle_3d_mode")
 
 # ============================== PAGES ===================================
 if page == "📊 Dashboard":
@@ -801,24 +1356,32 @@ if page == "📊 Dashboard":
         with st.container(key="card_dash1"):
             donut_df = fdf["InvType_clean"].value_counts().reset_index()
             donut_df.columns = ["InvestmentType", "Count"]
-            fig = px.pie(
-                donut_df, names="InvestmentType", values="Count", hole=0.55,
-                title="Count of Startups by Investment Type",
-            )
-            st.plotly_chart(style_fig(fig), use_container_width=True)
+            if view_3d:
+                html = render_3d_highcharts("pie", donut_df, "Count of Startups by Investment Type", "InvestmentType", "Count")
+                components.html(html, height=380)
+            else:
+                fig = px.pie(
+                    donut_df, names="InvestmentType", values="Count", hole=0.55,
+                    title="Count of Startups by Investment Type",
+                )
+                st.plotly_chart(style_fig(fig), use_container_width=True)
 
     with col2:
         with st.container(key="card_dash2"):
             ind_df = (
                 fdf.groupby("Industry_clean")["FundingAmount"].sum().sort_values(ascending=False).head(10)
             ).reset_index()
-            fig = px.bar(
-                ind_df, x="FundingAmount", y="Industry_clean", orientation="h",
-                title="Sum of Funding Amount by Industry",
-                labels={"FundingAmount": "Funding Amount ($)", "Industry_clean": "Industry"},
-            )
-            fig.update_yaxes(autorange="reversed")
-            st.plotly_chart(style_fig(fig), use_container_width=True)
+            if view_3d:
+                html = render_3d_highcharts("column", ind_df, "Sum of Funding Amount by Industry", "Industry_clean", "FundingAmount", label_suffix=" $")
+                components.html(html, height=380)
+            else:
+                fig = px.bar(
+                    ind_df, x="FundingAmount", y="Industry_clean", orientation="h",
+                    title="Sum of Funding Amount by Industry",
+                    labels={"FundingAmount": "Funding Amount ($)", "Industry_clean": "Industry"},
+                )
+                fig.update_yaxes(autorange="reversed")
+                st.plotly_chart(style_fig(fig), use_container_width=True)
 
     col3, col4 = st.columns(2)
     with col3:
@@ -826,23 +1389,31 @@ if page == "📊 Dashboard":
             city_df = (
                 fdf.groupby("City_clean")["FundingAmount"].sum().sort_values(ascending=False).head(10)
             ).reset_index()
-            fig = px.bar(
-                city_df, x="FundingAmount", y="City_clean", orientation="h",
-                title="Sum of Funding Amount by City",
-                labels={"FundingAmount": "Funding Amount ($)", "City_clean": "City"},
-            )
-            fig.update_yaxes(autorange="reversed")
-            st.plotly_chart(style_fig(fig), use_container_width=True)
+            if view_3d:
+                html = render_3d_highcharts("column", city_df, "Sum of Funding Amount by City", "City_clean", "FundingAmount", label_suffix=" $")
+                components.html(html, height=380)
+            else:
+                fig = px.bar(
+                    city_df, x="FundingAmount", y="City_clean", orientation="h",
+                    title="Sum of Funding Amount by City",
+                    labels={"FundingAmount": "Funding Amount ($)", "City_clean": "City"},
+                )
+                fig.update_yaxes(autorange="reversed")
+                st.plotly_chart(style_fig(fig), use_container_width=True)
 
     with col4:
         with st.container(key="card_dash4"):
             year_df = fdf.groupby("Year")["FundingAmount"].sum().reset_index()
-            fig = px.line(
-                year_df, x="Year", y="FundingAmount", markers=True,
-                title="Sum of Funding Amount by Year",
-            )
-            fig.update_traces(line=dict(width=3))
-            st.plotly_chart(style_fig(fig), use_container_width=True)
+            if view_3d:
+                html = render_3d_highcharts("column", year_df, "Sum of Funding Amount by Year", "Year", "FundingAmount", label_suffix=" $")
+                components.html(html, height=380)
+            else:
+                fig = px.line(
+                    year_df, x="Year", y="FundingAmount", markers=True,
+                    title="Sum of Funding Amount by Year",
+                )
+                fig.update_traces(line=dict(width=3))
+                st.plotly_chart(style_fig(fig), use_container_width=True)
 
     col_q, col_inv = st.columns(2)
     with col_q:
@@ -850,38 +1421,42 @@ if page == "📊 Dashboard":
             quarter_df = fdf.groupby("Quarter")["FundingAmount"].sum().reset_index()
             quarter_df = quarter_df.sort_values("FundingAmount", ascending=False)
             
-            q_x = [f"Q{int(q)}" for q in quarter_df["Quarter"]]
-            q_y = list(quarter_df["FundingAmount"])
-            q_text = []
-            for v in q_y:
-                if v >= 1e9:
-                    q_text.append(f"${v/1e9:.2f}B")
-                else:
-                    q_text.append(f"${v/1e6:.1f}M")
-                    
-            total_fund = fdf["FundingAmount"].sum()
-            q_x.append("Total")
-            q_y.append(total_fund)
-            if total_fund >= 1e9:
-                q_text.append(f"${total_fund/1e9:.2f}B")
+            if view_3d:
+                html = render_3d_highcharts("column", quarter_df, "Sum of Funding Amount by Quarter", "Quarter", "FundingAmount", label_suffix=" $", x_prefix="Q")
+                components.html(html, height=380)
             else:
-                q_text.append(f"${total_fund/1e6:.1f}M")
-                
-            fig_q = go.Figure(go.Waterfall(
-                name="Quarterly Funding",
-                orientation="v",
-                measure=["relative"] * len(quarter_df) + ["total"],
-                x=q_x,
-                textposition="outside",
-                text=q_text,
-                y=q_y,
-                connector={"line": {"color": "rgba(255,255,255,0.2)"}},
-                increasing={"marker": {"color": "#16C79A"}},
-                decreasing={"marker": {"color": "#FF6B6B"}},
-                totals={"marker": {"color": "#5B6EF5"}}
-            ))
-            fig_q.update_layout(title="Sum of Funding Amount by Quarter")
-            st.plotly_chart(style_fig(fig_q), use_container_width=True)
+                q_x = [f"Q{int(q)}" for q in quarter_df["Quarter"]]
+                q_y = list(quarter_df["FundingAmount"])
+                q_text = []
+                for v in q_y:
+                    if v >= 1e9:
+                        q_text.append(f"${v/1e9:.2f}B")
+                    else:
+                        q_text.append(f"${v/1e6:.1f}M")
+                        
+                total_fund = fdf["FundingAmount"].sum()
+                q_x.append("Total")
+                q_y.append(total_fund)
+                if total_fund >= 1e9:
+                    q_text.append(f"${total_fund/1e9:.2f}B")
+                else:
+                    q_text.append(f"${total_fund/1e6:.1f}M")
+                    
+                fig_q = go.Figure(go.Waterfall(
+                    name="Quarterly Funding",
+                    orientation="v",
+                    measure=["relative"] * len(quarter_df) + ["total"],
+                    x=q_x,
+                    textposition="outside",
+                    text=q_text,
+                    y=q_y,
+                    connector={"line": {"color": "rgba(255,255,255,0.2)"}},
+                    increasing={"marker": {"color": "#16C79A"}},
+                    decreasing={"marker": {"color": "#FF6B6B"}},
+                    totals={"marker": {"color": "#5B6EF5"}}
+                ))
+                fig_q.update_layout(title="Sum of Funding Amount by Quarter")
+                st.plotly_chart(style_fig(fig_q), use_container_width=True)
 
     with col_inv:
         with st.container(key="card_dash_investors"):
@@ -890,22 +1465,31 @@ if page == "📊 Dashboard":
             top_investors = investors_exploded[investors_exploded != ""].value_counts().head(10).reset_index()
             top_investors.columns = ["Investor", "Count"]
             
-            fig_inv = px.bar(
-                top_investors, x="Count", y="Investor", orientation="h",
-                title="Count of Startups by Investors",
-                labels={"Count": "Number of Startups", "Investor": "Investor Name"},
-            )
-            fig_inv.update_yaxes(autorange="reversed")
-            st.plotly_chart(style_fig(fig_inv), use_container_width=True)
+            if view_3d:
+                html = render_3d_highcharts("column", top_investors, "Count of Startups by Investors", "Investor", "Count")
+                components.html(html, height=380)
+            else:
+                fig_inv = px.bar(
+                    top_investors, x="Count", y="Investor", orientation="h",
+                    title="Count of Startups by Investors",
+                    labels={"Count": "Number of Startups", "Investor": "Investor Name"},
+                )
+                fig_inv.update_yaxes(autorange="reversed")
+                st.plotly_chart(style_fig(fig_inv), use_container_width=True)
 
     with st.container(key="card_dash5"):
         treemap_df = fdf.groupby("Industry_clean")["FundingAmount"].sum().reset_index()
         treemap_df = treemap_df[treemap_df["FundingAmount"] > 0]
-        fig = px.treemap(
-            treemap_df, path=["Industry_clean"], values="FundingAmount",
-            title="Funding Amount Treemap by Industry",
-        )
-        st.plotly_chart(style_fig(fig, height=420), use_container_width=True)
+        
+        if view_3d:
+            html = render_3d_highcharts("column", treemap_df.head(10), "Funding Amount by Industry (3D Column View)", "Industry_clean", "FundingAmount", label_suffix=" $")
+            components.html(html, height=380)
+        else:
+            fig = px.treemap(
+                treemap_df, path=["Industry_clean"], values="FundingAmount",
+                title="Funding Amount Treemap by Industry",
+            )
+            st.plotly_chart(style_fig(fig, height=420), use_container_width=True)
 
     with st.container(key="card_dash6"):
         tier_counts = (
@@ -915,14 +1499,62 @@ if page == "📊 Dashboard":
             .reset_index()
         )
         tier_counts.columns = ["FundingTier", "Count"]
-        fig = px.bar(
-            tier_counts, x="FundingTier", y="Count", color="FundingTier",
-            title="Count of Deals by Funding Tier (Micro < $1M, Small $1-10M, Mid $10-50M, Large $50M+)",
-            category_orders={"FundingTier": TIER_LABELS},
-            color_discrete_map={"Micro": "#5B6EF5", "Small": "#16C79A", "Mid": "#F2B705", "Large": "#FF6B6B"},
-        )
-        fig.update_layout(showlegend=False)
-        st.plotly_chart(style_fig(fig), use_container_width=True)
+        
+        if view_3d:
+            html = render_3d_highcharts("column", tier_counts, "Count of Deals by Funding Tier", "FundingTier", "Count")
+            components.html(html, height=380)
+        else:
+            fig = px.bar(
+                tier_counts, x="FundingTier", y="Count", color="FundingTier",
+                title="Count of Deals by Funding Tier (Micro < $1M, Small $1-10M, Mid $10-50M, Large $50M+)",
+                category_orders={"FundingTier": TIER_LABELS},
+                color_discrete_map={"Micro": "#5B6EF5", "Small": "#16C79A", "Mid": "#F2B705", "Large": "#FF6B6B"},
+            )
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    with st.container(key="card_dash_timelapse"):
+        anim_df, top_ind = get_animated_industry_df(fdf)
+        if not anim_df.empty:
+            max_val = anim_df["FundingAmount"].max()
+            if max_val <= 0:
+                max_val = 1.0
+            
+            fig_anim = px.bar(
+                anim_df,
+                x="FundingAmount",
+                y="Industry_clean",
+                color="Industry_clean",
+                animation_frame="Year",
+                orientation="h",
+                title="⏳ Industry Funding Evolution Over Time (Playable Chronological Timelapse)",
+                labels={"FundingAmount": "Funding Amount ($)", "Industry_clean": "Industry"},
+                category_orders={"Industry_clean": top_ind},
+                range_x=[0, max_val * 1.15],
+                color_discrete_sequence=PALETTE
+            )
+            
+            fig_anim = style_fig(fig_anim, height=450)
+            fig_anim.update_yaxes(autorange="reversed")
+            fig_anim.update_layout(showlegend=False)
+            
+            fig_anim.layout.updatemenus[0].buttons[0].args[1]["frame"]["duration"] = 1200
+            fig_anim.layout.updatemenus[0].buttons[0].args[1]["transition"]["duration"] = 700
+            
+            fig_anim.update_layout(
+                sliders=[{
+                    "currentvalue": {
+                        "font": {"family": "Space Grotesk, sans-serif", "size": 18, "color": "#5B6EF5"},
+                        "prefix": "Year: ",
+                        "visible": True,
+                        "xanchor": "right"
+                    }
+                }]
+            )
+            
+            st.plotly_chart(fig_anim, use_container_width=True)
+
+
 
     with st.expander("View filtered raw data"):
         st.dataframe(fdf.head(200))
@@ -972,6 +1604,7 @@ elif page == "💰 Predict Funding Amount":
                 row.update(domain_flags)
                 rows.append(row)
             X_new = pd.DataFrame(rows)
+            X_new = add_engineered_features(X_new, df)
             log_preds = reg_pipe.predict(X_new)
             pred_amounts = np.expm1(log_preds)
             X_new["Predicted_Amount"] = pred_amounts
@@ -983,6 +1616,16 @@ elif page == "💰 Predict Funding Amount":
                 high = np.expm1(log_pred + resid_std)
                 st.success(f"### Estimated Funding: ${pred_amount:,.0f}")
                 st.caption(f"Likely range: ${low:,.0f} – ${high:,.0f} (based on model uncertainty)")
+                
+                # Explainable AI Breakdown
+                bias, mapped_contribs = explain_rf_prediction(reg_pipe, X_new, is_regression=True)
+                with st.container(key="card_reg_explain"):
+                    fig_explain = make_waterfall_chart(
+                        bias, mapped_contribs, log_pred,
+                        title="Prediction Breakdown — How features impacted this funding estimate",
+                        is_regression=True
+                    )
+                    st.plotly_chart(fig_explain, use_container_width=True)
             else:
                 st.success("### Comparative Predictions")
                 X_new["Scenario"] = X_new.apply(
@@ -1052,6 +1695,7 @@ elif page == "🎯 Predict Funding Tier":
                 row.update(domain_flags)
                 rows.append(row)
             X_new3 = pd.DataFrame(rows)
+            X_new3 = add_engineered_features(X_new3, df)
             pred_tiers = tier_pipe.predict(X_new3)
             proba3_matrix = tier_pipe.predict_proba(X_new3)
             X_new3["Predicted_Tier"] = pred_tiers
@@ -1063,15 +1707,32 @@ elif page == "🎯 Predict Funding Tier":
                 proba_df3["FundingTier"] = pd.Categorical(proba_df3["FundingTier"], categories=TIER_LABELS, ordered=True)
                 proba_df3 = proba_df3.sort_values("FundingTier")
                 st.success(f"### Predicted Tier: {pred_tier} ({TIER_DESCRIPTIONS[pred_tier]})")
-                with st.container(key="card_tier_result"):
-                    fig = px.bar(
-                        proba_df3, x="FundingTier", y="Probability", color="FundingTier",
-                        title="Predicted Probability by Tier",
-                        category_orders={"FundingTier": TIER_LABELS},
-                        color_discrete_map={"Micro": "#5B6EF5", "Small": "#16C79A", "Mid": "#F2B705", "Large": "#FF6B6B"},
-                    )
-                    fig.update_layout(showlegend=False)
-                    st.plotly_chart(style_fig(fig), use_container_width=True)
+                
+                # Explainable AI Breakdown
+                pred_class_idx = list(tier_pipe.classes_).index(pred_tier)
+                bias, mapped_contribs = explain_rf_prediction(
+                    tier_pipe, X_new3, is_regression=False, class_index=pred_class_idx
+                )
+                
+                c_res1, c_res2 = st.columns(2)
+                with c_res1:
+                    with st.container(key="card_tier_result"):
+                        fig = px.bar(
+                            proba_df3, x="FundingTier", y="Probability", color="FundingTier",
+                            title="Predicted Probability by Tier",
+                            category_orders={"FundingTier": TIER_LABELS},
+                            color_discrete_map={"Micro": "#5B6EF5", "Small": "#16C79A", "Mid": "#F2B705", "Large": "#FF6B6B"},
+                        )
+                        fig.update_layout(showlegend=False)
+                        st.plotly_chart(style_fig(fig), use_container_width=True)
+                with c_res2:
+                    with st.container(key="card_tier_explain"):
+                        fig_explain = make_waterfall_chart(
+                            bias, mapped_contribs, proba3[pred_class_idx],
+                            title=f"Prediction Breakdown — Impact on '{pred_tier}' Probability",
+                            is_regression=False
+                        )
+                        st.plotly_chart(fig_explain, use_container_width=True)
             else:
                 st.success("### Comparative Predictions")
                 X_new3["Scenario"] = X_new3.apply(
@@ -1149,6 +1810,7 @@ elif page == "🏷️ Predict Investment Type":
                 row.update(domain_flags)
                 rows.append(row)
             X_new2 = pd.DataFrame(rows)
+            X_new2 = add_engineered_features(X_new2, df)
             pred_classes = clf_pipe.predict(X_new2)
             proba2_matrix = clf_pipe.predict_proba(X_new2)
             X_new2["Predicted_Round"] = pred_classes
@@ -1160,13 +1822,30 @@ elif page == "🏷️ Predict Investment Type":
                     "Probability", ascending=False
                 )
                 st.success(f"### Most Likely Round: {pred_class}")
-                with st.container(key="card_clf_result"):
-                    fig = px.bar(
-                        proba_df, x="Probability", y="InvestmentType", orientation="h",
-                        title="Predicted Probability by Round Type",
-                    )
-                    fig.update_yaxes(autorange="reversed")
-                    st.plotly_chart(style_fig(fig), use_container_width=True)
+                
+                # Explainable AI Breakdown
+                pred_class_idx = list(clf_pipe.classes_).index(pred_class)
+                bias, mapped_contribs = explain_rf_prediction(
+                    clf_pipe, X_new2, is_regression=False, class_index=pred_class_idx
+                )
+                
+                c_res1, c_res2 = st.columns(2)
+                with c_res1:
+                    with st.container(key="card_clf_result"):
+                        fig = px.bar(
+                            proba_df, x="Probability", y="InvestmentType", orientation="h",
+                            title="Predicted Probability by Round Type",
+                        )
+                        fig.update_yaxes(autorange="reversed")
+                        st.plotly_chart(style_fig(fig), use_container_width=True)
+                with c_res2:
+                    with st.container(key="card_clf_explain"):
+                        fig_explain = make_waterfall_chart(
+                            bias, mapped_contribs, proba[pred_class_idx],
+                            title=f"Prediction Breakdown — Impact on '{pred_class}' Probability",
+                            is_regression=False
+                        )
+                        st.plotly_chart(fig_explain, use_container_width=True)
             else:
                 st.success("### Comparative Predictions")
                 X_new2["Scenario"] = X_new2.apply(
@@ -1193,6 +1872,118 @@ elif page == "🏷️ Predict Investment Type":
                 st.write("#### Detailed Breakdown")
                 show_df = X_new2[["Industry_clean", "City_clean", "Year", "HasTopInvestor", "Predicted_Round"]]
                 st.dataframe(show_df, use_container_width=True)
+
+# ============================ MATCHMAKER & SIMULATOR ============================
+elif page == "🤝 Investor Matchmaker & Simulator":
+    st.title("🤝 Investor Matchmaker & Funding Simulator")
+    st.markdown(
+        "Find the most compatible venture capital firms for your startup based on "
+        "historical deals, and simulate the dilution impact of your upcoming funding round."
+    )
+    
+    col_left, col_right = st.columns(2)
+    
+    with col_left:
+        st.subheader("🔍 Investor Matchmaker")
+        with st.container(key="card_matchmaker_inputs"):
+            c1, c2 = st.columns(2)
+            with c1:
+                match_industry = st.selectbox("Industry", sorted(df["Industry_clean"].unique()), index=0, key="match_ind")
+                match_city = st.selectbox("City / Hub", sorted(df["City_clean"].unique()), index=0, key="match_cit")
+            with c2:
+                match_tier = st.selectbox("Expected Stage (Funding Tier)", TIER_LABELS, index=1, key="match_tie")
+                match_domain = st.selectbox("Sub-Vertical Domain", ["None", "SaaS", "AI", "Platform", "Marketplace", "Mobile", "B2B", "B2C", "Delivery", "Healthcare", "Edtech"], key="match_dom")
+            
+            run_matchmaker = st.button("Find Matching Investors", type="primary", key="btn_matchmaker")
+            
+        if run_matchmaker:
+            st.write("")
+            matching_df = match_investors(df, match_industry, match_city, match_tier, match_domain)
+            if len(matching_df) == 0:
+                st.warning("No matching investors found in our database for this combination. Try broadening your criteria.")
+            else:
+                st.success("### Top 10 Investor Matches")
+                for idx, r in matching_df.iterrows():
+                    score = r["Match Score (%)"]
+                    color = "#16C79A" if score >= 70 else "#F2B705" if score >= 40 else "#FF6B6B"
+                    
+                    st.markdown(f"""
+                    <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); padding: 12px 16px; border-radius: 12px; margin-bottom: 10px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                            <span style="font-weight: 700; color: #EAF0FF; font-family: 'Space Grotesk', sans-serif; font-size: 1rem;">{r['Investor']}</span>
+                            <span style="background: {color}; color: #0A0F2C; font-weight: 700; padding: 2px 8px; border-radius: 20px; font-size: 0.8rem;">{score}% Match</span>
+                        </div>
+                        <div style="font-size: 0.82rem; color: #B8C2E8; margin-bottom: 8px;">
+                            💼 <b>Total Deals:</b> {r['Total Deals']} &nbsp;•&nbsp; 
+                            🏭 <b>{match_industry} Deals:</b> {r['Industry Deals']} &nbsp;•&nbsp; 
+                            🌆 <b>{match_city} Deals:</b> {r['City Deals']}
+                        </div>
+                        <div style="font-size: 0.8rem; color: #8B95C9;">
+                            🚀 <b>Top Portfolios:</b> <span style="color: #F2B705;">{r['Key Portfolios']}</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+    with col_right:
+        st.subheader("📊 Cap Table Dilution Simulator")
+        with st.container(key="card_simulator"):
+            target_raise = st.number_input("Target Raise Amount ($)", min_value=10000, max_value=500000000, value=1000000, step=50000, key="sim_raise")
+            pre_money_val = st.number_input("Pre-Money Valuation ($)", min_value=10000, max_value=2000000000, value=4000000, step=100000, key="sim_preval")
+            
+            st.markdown("##### Current Equity Distribution (%)")
+            c_f1, c_f2 = st.columns(2)
+            with c_f1:
+                founder1_pct = st.slider("Founder 1 Equity", 0, 100, 60, key="sim_f1")
+            with c_f2:
+                founder2_pct = st.slider("Founder 2 Equity", 0, 100 - founder1_pct, 100 - founder1_pct, key="sim_f2")
+                
+            other_pct = 100 - founder1_pct - founder2_pct
+            if other_pct > 0:
+                st.caption(f"Other Shareholders: {other_pct}%")
+                
+            # Perform simulator calculations
+            post_money_val = pre_money_val + target_raise
+            dilution_rate = target_raise / post_money_val
+            dilution_pct = dilution_rate * 100
+            
+            # Post-round equity calculations
+            new_investor_pct = dilution_pct
+            new_f1_pct = founder1_pct * (1 - dilution_rate)
+            new_f2_pct = founder2_pct * (1 - dilution_rate)
+            new_other_pct = other_pct * (1 - dilution_rate)
+            
+            st.markdown("---")
+            st.markdown("#### Dilution Outcome")
+            
+            c_m1, c_m2 = st.columns(2)
+            c_m1.metric("Post-Money Valuation", f"${post_money_val:,.0f}")
+            c_m2.metric("New Investor Share", f"{dilution_pct:.1f}%")
+            
+            # Advisor Badges
+            if dilution_pct < 10.0:
+                st.info("💡 **Low Dilution**: Excellent term conservation for founders, but ensure the high valuation is justified to avoid down-rounds in the future.")
+            elif 15.0 <= dilution_pct <= 25.0:
+                st.success("✅ **Healthy Venture Standard**: Dilution is in the standard range (15% - 25%) for a standard institutional round.")
+            elif dilution_pct > 30.0:
+                st.warning("⚠️ **High Dilution**: Founders are diluting heavily in this round. Consider raising less capital or negotiating a higher valuation.")
+                
+            # Plotly Cap Table Pie Chart
+            pie_data = {
+                "Shareholder": ["Founder 1", "Founder 2", "New Investor"],
+                "Equity": [new_f1_pct, new_f2_pct, new_investor_pct]
+            }
+            if new_other_pct > 0:
+                pie_data["Shareholder"].append("Other Shareholders")
+                pie_data["Equity"].append(new_other_pct)
+                
+            df_pie = pd.DataFrame(pie_data)
+            fig_pie = px.pie(
+                df_pie, names="Shareholder", values="Equity",
+                title="Post-Round Cap Table",
+                hole=0.4
+            )
+            fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+            st.plotly_chart(style_fig(fig_pie, height=340), use_container_width=True)
 
 # ============================ MODEL PERFORMANCE ================================
 elif page == "📈 Model Performance":
